@@ -260,6 +260,139 @@ Crie um `.env.example` versionado com as chaves (sem valores) e um `.env` local 
 
 ---
 
+### Dados de teste: Faker vai em fixture, nunca no teste
+
+`faker` é ótimo para gerar dados dinâmicos e evitar colisões entre execuções paralelas. O erro comum é chamar o faker direto dentro do teste — isso embaralha o Arrange e dificulta debugar quando algo falha.
+
+```ts
+// ❌ Errado — faker espalhado dentro do teste
+test('registers a new user', async ({ page }) => {
+  const name = faker.person.fullName();       // ← dados gerados aqui
+  const email = faker.internet.email();       // ← e aqui
+  await page.getByTestId('name').fill(name);
+  await page.getByTestId('email').fill(email);
+});
+
+// ✅ Correto — builder centralizado em fixture/data
+// tests/fixtures/data/user.mock.ts
+export function buildUserData() {
+  return {
+    name: faker.person.fullName(),
+    email: faker.internet.email(),
+    phone: faker.phone.number('(##) 9####-####'),
+  };
+}
+
+// No teste — limpo, intenção clara
+test('registers a new user', async ({ page }) => {
+  const user = buildUserData();   // ← tudo vem do builder
+  await page.getByTestId('name').fill(user.name);
+  await page.getByTestId('email').fill(user.email);
+});
+```
+
+**Por que isso importa:**
+- Quando o teste falha, você sabe exatamente quais dados foram usados (o builder pode logar ou receber seed fixo)
+- O builder é reutilizável em múltiplos testes sem duplicar lógica
+- Se o schema mudar, você corrige em um lugar só
+- Faker com seed fixo permite reproduzir falhas: `faker.seed(12345)`
+
+```ts
+// Reproduzindo uma falha específica com seed fixo
+export function buildUserData(seed?: number) {
+  if (seed !== undefined) faker.seed(seed);
+  return {
+    name: faker.person.fullName(),
+    email: faker.internet.email(),
+  };
+}
+
+// No teste que estava falhando
+const user = buildUserData(12345); // sempre gera os mesmos dados
+```
+
+---
+
+### Dados mockados: quando usar `page.route()` e quando não usar
+
+Mockar a API significa interceptar uma chamada e devolver uma resposta falsa em vez de bater no servidor real. É uma ferramenta poderosa — mas usada no lugar errado, ela cria uma falsa sensação de segurança.
+
+**A pergunta certa antes de mockar:**
+> "O que este teste está validando — o comportamento da UI ou a integração com a API?"
+
+```
+Validando comportamento da UI  →  Mock é adequado
+Validando integração com a API →  Nunca mock — use dados reais
+```
+
+#### Quando usar mock (`page.route()`)
+
+```ts
+// ✅ Testar estado vazio — a UI exibe a mensagem certa quando não há dados
+test('displays empty state when there are no records', async ({ page }) => {
+  await page.route('**/api/orders', route =>
+    route.fulfill({ json: [] })
+  );
+  await page.goto('/orders');
+  await expect(page.getByTestId('empty-state')).toContainText('No orders found');
+});
+
+// ✅ Testar erro de servidor — a UI exibe o banner de erro corretamente
+test('displays error banner when API returns 500', async ({ page }) => {
+  await page.route('**/api/orders', route =>
+    route.fulfill({ status: 500, json: { message: 'Internal Server Error' } })
+  );
+  await page.goto('/orders');
+  await expect(page.getByTestId('error-banner')).toBeVisible();
+});
+
+// ✅ Testar feature flag — comportamento condicional baseado em config
+test('shows maintenance banner when flag is active', async ({ page }) => {
+  await page.route('**/api/config', route =>
+    route.fulfill({ json: { maintenance: true } })
+  );
+  await page.goto('/');
+  await expect(page.getByTestId('maintenance-banner')).toBeVisible();
+});
+```
+
+#### Quando NÃO usar mock
+
+```ts
+// ❌ Errado — testar o fluxo de criação mockando a própria criação
+test('creates a new order', async ({ page }) => {
+  await page.route('POST **/api/orders', route =>    // ← mock da criação
+    route.fulfill({ json: { id: 999, status: 'created' } })
+  );
+  // Este teste não prova nada — a API real pode estar quebrada
+  // e o teste sempre vai passar
+});
+
+// ✅ Correto — criação real via API na fixture, UI apenas valida
+test('creates a new order', async ({ page, orderForm }) => {
+  await orderForm.fillAndSubmit({ product: 'Widget', qty: 3 });
+  const response = page.waitForResponse('POST **/api/orders');
+  await orderForm.submit();
+  expect((await response).status()).toBe(201);
+  await expect(page.getByTestId('order-success')).toBeVisible();
+});
+```
+
+#### A regra de ouro do mock
+
+| Situação | Usar mock? |
+|---|---|
+| Testar como a UI reage a uma lista vazia | ✅ Sim |
+| Testar como a UI reage a um erro 500 | ✅ Sim |
+| Testar feature flag / configuração remota | ✅ Sim |
+| Testar o fluxo que **você está validando** | ❌ Não — use API real |
+| Testar dados que precisam existir antes do teste | ❌ Não — crie via API na fixture |
+| Testar formulários de criação/edição | ❌ Não — valide a resposta real |
+
+> **Sinal de alerta:** se você está mockando a mesma rota que a ação do teste dispara, você provavelmente está testando o mock, não o sistema.
+
+---
+
 ## 5. Boas práticas de escrita de testes — Cypress
 
 ### Seletores: mesma lógica, sintaxe diferente
@@ -390,6 +523,123 @@ cy.get('[data-testid="password"]').type(Cypress.env('PASSWORD'), { log: false })
 ```
 
 `cypress.env.json` nunca entra no repositório. Versione apenas o `cypress.env.example.json` com as chaves vazias.
+
+---
+
+### Dados de teste: Faker vai em fixture, nunca no teste
+
+A mesma regra do Playwright se aplica aqui. Faker direto dentro do `it()` mistura Arrange com geração de dados e dificulta debugar falhas.
+
+```js
+// ❌ Errado — faker espalhado dentro do teste
+it('registers a new user', () => {
+  const name = faker.person.fullName();   // ← dados gerados aqui
+  const email = faker.internet.email();
+  cy.get('[data-testid="name"]').type(name);
+  cy.get('[data-testid="email"]').type(email);
+});
+
+// ✅ Correto — builder centralizado em cypress/fixtures/
+// cypress/fixtures/user.js
+export function buildUserData() {
+  return {
+    name: faker.person.fullName(),
+    email: faker.internet.email(),
+    phone: faker.phone.number('(##) 9####-####'),
+  };
+}
+
+// No teste — limpo e reutilizável
+it('registers a new user', () => {
+  const user = buildUserData();
+  cy.get('[data-testid="name"]').type(user.name);
+  cy.get('[data-testid="email"]').type(user.email);
+});
+```
+
+**Quando o teste falhar**, você consegue reproduzir passando um seed fixo para o faker no builder — sem precisar descobrir quais dados causaram a falha na execução anterior.
+
+---
+
+### Dados mockados: quando usar `cy.intercept()` e quando não usar
+
+A mesma filosofia do Playwright se aplica no Cypress: mock serve para controlar o comportamento da UI diante de respostas específicas da API — não para substituir a API real nos fluxos que você está validando.
+
+**A pergunta certa antes de mockar:**
+> "O que este teste está validando — o comportamento da UI ou a integração com a API?"
+
+```
+Validando comportamento da UI  →  cy.intercept() é adequado
+Validando integração com a API →  Nunca mock — use dados reais
+```
+
+#### Quando usar mock (`cy.intercept()`)
+
+```js
+// ✅ Testar estado vazio
+it('shows empty state when there are no orders', () => {
+  cy.intercept('GET', '/api/orders', { body: [] }).as('getOrders');
+  cy.visit('/orders');
+  cy.wait('@getOrders');
+  cy.get('[data-testid="empty-state"]').should('contain', 'No orders found');
+});
+
+// ✅ Testar erro de servidor
+it('shows error banner when API returns 500', () => {
+  cy.intercept('GET', '/api/orders', { statusCode: 500 }).as('getOrders');
+  cy.visit('/orders');
+  cy.wait('@getOrders');
+  cy.get('[data-testid="error-banner"]').should('be.visible');
+});
+
+// ✅ Testar loading state
+it('shows skeleton while loading', () => {
+  cy.intercept('GET', '/api/orders', (req) => {
+    req.reply((res) => {
+      res.setDelay(2000);  // simula latência
+    });
+  }).as('getOrders');
+  cy.visit('/orders');
+  cy.get('[data-testid="skeleton-loader"]').should('be.visible');
+  cy.wait('@getOrders');
+  cy.get('[data-testid="skeleton-loader"]').should('not.exist');
+});
+```
+
+#### Quando NÃO usar mock
+
+```js
+// ❌ Errado — mockando a própria criação que está sendo testada
+it('creates a new order', () => {
+  cy.intercept('POST', '/api/orders', { body: { id: 999, status: 'created' } }).as('createOrder');
+  // Este teste não prova nada — a API real pode estar quebrada
+  // e o teste sempre vai passar
+  cy.get('[data-testid="submit-btn"]').click();
+  cy.wait('@createOrder');
+});
+
+// ✅ Correto — deixa a API real processar, valida a resposta
+it('creates a new order', () => {
+  cy.intercept('POST', '/api/orders').as('createOrder');
+  cy.get('[data-testid="product-input"]').type('Widget');
+  cy.get('[data-testid="submit-btn"]').click();
+  cy.wait('@createOrder').its('response.statusCode').should('eq', 201);
+  cy.get('[data-testid="order-success"]').should('be.visible');
+});
+```
+
+#### A regra de ouro do mock
+
+| Situação | Usar mock? |
+|---|---|
+| Testar como a UI reage a uma lista vazia | ✅ Sim |
+| Testar como a UI reage a um erro 500 | ✅ Sim |
+| Testar loading state com latência simulada | ✅ Sim |
+| Testar o fluxo que **você está validando** | ❌ Não — use API real |
+| Testar dados que precisam existir antes do teste | ❌ Não — crie via API no `before()` |
+| Testar formulários de criação/edição | ❌ Não — valide o status code real |
+
+> **Sinal de alerta:** se você usa `cy.intercept()` para interceptar exatamente a chamada que a ação do teste dispara e preenche uma resposta de sucesso manual, você está testando o mock — não o sistema.
 
 ---
 
